@@ -2,7 +2,7 @@
 
 PowerGuard is a robust and intelligent energy monitoring and protection system designed to provide real-time analytics, automated protection mechanisms, and seamless integration with cloud platforms.
 
-![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/YOUR_USERNAME/PowerGuard/main.yml?branch=main&style=flat-square)
+![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/chandini1727/PowerGuard/main.yml?branch=main)
 
 ---
 
