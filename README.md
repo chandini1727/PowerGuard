@@ -1,6 +1,6 @@
-# RFC: Sandbox Egress Traffic Policy (Allowlist API)
+# RFC: Sandbox Egress Traffic Policy 
 
-> **Status:** WIP
+> **Status:** INPROGESS
 
 ## Authors
 - Agents Team
