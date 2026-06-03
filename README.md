@@ -64,6 +64,9 @@ sequenceDiagram
     TS->>DB: SELECT Org Limit & Usage FOR UPDATE
     TS->>DB: SELECT Project Limit & Usage FOR UPDATE
     
+    TS->>TS: Calculate: (Org Usage + 1) > Org Limit ?
+    TS->>TS: Calculate: (Project Usage + 1) > Project Limit ?
+    
     alt Org Limit Exceeded (e.g. 20/20) OR Project Limit Exceeded (e.g. 5/5)
         DB-->>TS: Return Current Usages
         TS->>DB: ROLLBACK
