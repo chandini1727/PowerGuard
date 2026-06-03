@@ -43,6 +43,50 @@ auditability — without quotas, the platform's multi-tenant
 safety story has a hole that's catastrophic on the first
 runaway agent.
 
+## Architecture & Request Flow
+
+This diagram illustrates the exact sequence of events when a user creates or deletes a sandbox, demonstrating how `aiagent-service` interacts with `tenant-service` to enforce limits safely.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant AI as aiagent-service
+    participant TS as tenant-service
+    participant DB as tenant-service DB
+
+    %% Create Sandbox Flow
+    User->>AI: POST /sandboxes
+    AI->>TS: ReserveOrgResourceQuota(sandboxes)
+    TS->>DB: SELECT limits FOR UPDATE
+    
+    alt Quota Exceeded
+        DB-->>TS: Return Current Usage (>= Limit)
+        TS-->>AI: Allowed: false
+        AI-->>User: 400 Bad Request (Quota Exceeded)
+    else Quota Available
+        DB-->>TS: Increment Usage
+        TS-->>AI: Allowed: true
+        
+        alt Creation Succeeds
+            AI->>AI: Provision Sandbox
+            AI-->>User: 201 Created
+        else Creation Fails (Network Error, etc.)
+            AI->>AI: Provisioning Fails
+            AI->>TS: ReleaseOrgResourceQuota(sandboxes) (Rollback)
+            TS->>DB: Decrement Usage
+            AI-->>User: 500 Internal Server Error
+        end
+    end
+
+    %% Delete Sandbox Flow
+    User->>AI: DELETE /sandboxes/{id}
+    AI->>AI: Deprovision Sandbox
+    AI->>TS: ReleaseOrgResourceQuota(sandboxes)
+    TS->>DB: Decrement Usage
+    AI-->>User: 204 No Content
+```
+
 ## Detailed Implementation (Phase 1)
 
 ### 1. Database Quota Seeding
@@ -63,7 +107,7 @@ We use the centralized quota system in `tenant-service` to enforce sandbox limit
 ### 4. The "Delete Sandbox" Flow
 1. **Release:** After deleting a sandbox, notify `tenant-service` to free up the slot for future use.
 
-## Roadmap: Future Work
+## Future Work
 
 - **CPU-hours.** This prevents users from leaving sandboxes running forever. It will be built in the future by updating the sandbox reconciler to track and store exactly how long each sandbox has been running.
 - **Egress bytes.** This will prevent a single sandbox from downloading terabytes of data and crashing the network. It will be built after the dedicated Sandbox Egress Gateway is launched to monitor network traffic.
