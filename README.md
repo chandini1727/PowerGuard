@@ -58,14 +58,21 @@ sequenceDiagram
     %% Create Sandbox Flow
     User->>AI: POST /sandboxes
     AI->>TS: ReserveOrgResourceQuota(sandboxes)
-    TS->>DB: SELECT limits FOR UPDATE
     
-    alt Quota Exceeded
-        DB-->>TS: Return Current Usage (>= Limit)
+    %% Quota Engine Checking Both Limits
+    TS->>DB: BEGIN TRANSACTION
+    TS->>DB: SELECT Org Limit & Usage FOR UPDATE
+    TS->>DB: SELECT Project Limit & Usage FOR UPDATE
+    
+    alt Org Limit Exceeded (e.g. 20/20) OR Project Limit Exceeded (e.g. 5/5)
+        DB-->>TS: Return Current Usages
+        TS->>DB: ROLLBACK
         TS-->>AI: Allowed: false
-        AI-->>User: 400 Bad Request (Quota Exceeded)
-    else Quota Available
-        DB-->>TS: Increment Usage
+        AI-->>User: 400 Bad Request (sandbox quota exceeded: limit X, current usage X)
+    else Both Quotas Available
+        TS->>DB: Increment Org Usage (+1)
+        TS->>DB: Increment Project Usage (+1)
+        TS->>DB: COMMIT
         TS-->>AI: Allowed: true
         
         alt Creation Succeeds
@@ -74,7 +81,7 @@ sequenceDiagram
         else Creation Fails (Network Error, etc.)
             AI->>AI: Provisioning Fails
             AI->>TS: ReleaseOrgResourceQuota(sandboxes) (Rollback)
-            TS->>DB: Decrement Usage
+            TS->>DB: Decrement Org & Project Usage (-1)
             AI-->>User: 500 Internal Server Error
         end
     end
@@ -83,7 +90,7 @@ sequenceDiagram
     User->>AI: DELETE /sandboxes/{id}
     AI->>AI: Deprovision Sandbox
     AI->>TS: ReleaseOrgResourceQuota(sandboxes)
-    TS->>DB: Decrement Usage
+    TS->>DB: Decrement Org & Project Usage (-1)
     AI-->>User: 204 No Content
 ```
 
