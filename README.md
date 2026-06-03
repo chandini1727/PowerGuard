@@ -1,123 +1,63 @@
-# RFC: Sandbox Quotas — Per-Org / Per-Project Ceilings
+# RFC: Sandbox Egress Traffic Policy (Allowlist API)
 
-> **Status:** Implemented (v1)
+> **Status:** WIP
 
 ## Authors
-
 - Agents Team
 
 ## Problem Statement
 
-v1 of the sandbox offering has no platform-side ceilings on
-per-project resource use. A single project can create unbounded
-concurrent sandboxes, run for unbounded CPU-hours, and exhaust
-cluster capacity that other projects need. The parent RFC
-([`rfc_sandboxes.md`](rfc_sandboxes.md)) names this as honour-
-system today; the honour-system does not survive the first real
-multi-tenant customer.
+When users create AI agent sandboxes, those agents often need to interact with external APIs (like GitHub, Stripe, or OpenAI). However, allowing a sandbox completely open access to the internet (`0.0.0.0/0`) is a significant security risk, as a compromised agent could download malware or exfiltrate data. 
 
-This RFC defines the quota surface needed to ship safely:
+We need a simple API that lets customers choose exactly which websites their sandbox is allowed to visit. To make this easy to use, customers must be able to type normal website names (like `api.github.com`) in addition to raw IP addresses.
 
-- **What's metered.** Concurrent active sandbox count per
-  project, CPU-hours per billing period, egress bytes per
-  billing period (when Phase 3's gateway lands), and storage
-  bytes for persistent volumes. Each dimension needs a
-  per-project ceiling and a per-org aggregate.
-- **Where it's enforced.** At the API layer (reject
-  `POST /sandboxes` over the concurrent cap with a clear
-  error), at the runtime layer (terminate / pause sandboxes
-  that overrun their CPU-hours budget), and at the egress layer
-  (rate-limit or block over the egress-bytes cap).
-- **How it's surfaced to customers.** Current usage vs. cap on
-  the console dashboard, machine-readable headers on API
-  responses (`X-Quota-Remaining`, `X-Quota-Reset`), and a clear
-  error code (`quota_exceeded`) that customer agent code can
-  catch and back off against.
-- **How it's set.** Plan-tier defaults (free / starter /
-  enterprise), per-tenant overrides for negotiated contracts,
-  and a self-service "raise my limit" flow that doesn't require
-  a support ticket for small bumps.
+To achieve this, we will only provide a mechanism for users to add IPs, IP ranges, or DNS names to the allow list. We will not worry about whether a DNS name resolves or whether an IP is valid/reachable at configuration time.
 
-Required for v1 alongside isolation, observability, and
-auditability — without quotas, the platform's multi-tenant
-safety story has a hole that's catastrophic on the first
-runaway agent.
+## Goals
 
-## Architecture & Request Flow
+- **G1. Block Everything By Default:** The API will automatically block all internet access for a sandbox unless the user specifically provides an allow list.
+- **G2. Blindly Accept Names:** Our API will accept whatever website names or IP addresses the user types in, and save them directly to the database without trying to verify if they are real or reachable.
+- **G3. Smart Network Enforcement:** We will rely on the cluster's network layer (like Cilium) to do the actual work of looking up the website names and blocking/allowing traffic while the sandbox is running.
+- **G4. Continuous Enforcement:** We will save the exact list the user provided in the database, so the system can constantly make sure the firewall rules stay updated.
 
-This diagram illustrates the exact sequence of events when a user creates or deletes a sandbox, demonstrating how `aiagent-service` interacts with `tenant-service` to enforce limits safely.
+## Non-Goals
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User
-    participant AI as aiagent-service
-    participant TS as tenant-service
-    participant DB as tenant-service DB
+- **No Website Validation:** Our backend API (`aiagent-service`) will *not* try to ping or look up the website names the user provides to verify if they are real.
 
-    %% Create Sandbox Flow
-    User->>AI: POST /sandboxes
-    AI->>TS: ReserveOrgResourceQuota(sandboxes)
-    
-    %% Quota Engine Checking Both Limits
-    TS->>DB: BEGIN TRANSACTION
-    TS->>DB: SELECT Org Limit & Usage FOR UPDATE
-    TS->>DB: SELECT Project Limit & Usage FOR UPDATE
-    
-    Note over TS: Check if (Org Usage + 1) > Org Limit
-    Note over TS: Check if (Project Usage + 1) > Project Limit
-    
-    alt Org Limit Exceeded (e.g. 20/20) OR Project Limit Exceeded (e.g. 5/5)
-        DB-->>TS: Return Current Usages
-        TS->>DB: ROLLBACK
-        TS-->>AI: Allowed: false
-        AI-->>User: 400 Bad Request (sandbox quota exceeded: limit X, current usage X)
-    else Both Quotas Available
-        TS->>DB: Increment Org Usage (+1)
-        TS->>DB: Increment Project Usage (+1)
-        TS->>DB: COMMIT
-        TS-->>AI: Allowed: true
-        
-        alt Creation Succeeds
-            AI->>AI: Provision Sandbox
-            AI-->>User: 201 Created
-        else Creation Fails (Network Error, etc.)
-            AI->>AI: Provisioning Fails
-            AI->>TS: ReleaseOrgResourceQuota(sandboxes) (Rollback)
-            TS->>DB: Decrement Org & Project Usage (-1)
-            AI-->>User: 500 Internal Server Error
-        end
-    end
+## API Surface
 
-    %% Delete Sandbox Flow
-    User->>AI: DELETE /sandboxes/{id}
-    AI->>AI: Deprovision Sandbox
-    AI->>TS: ReleaseOrgResourceQuota(sandboxes)
-    TS->>DB: Decrement Org & Project Usage (-1)
-    AI-->>User: 204 No Content
+The `CreateSandboxRequest` will be extended with an optional `egress` object. 
+
+### Schema Definition
+```json
+"egress": {
+  "mode": "deny_all | allow_list",
+  "allow": [
+    {
+      "host": "string (IP, CIDR, or DNS name)",
+      "protocol": "TCP | UDP",
+      "ports": [int]
+    }
+  ]
+}
 ```
 
-## Detailed Implementation (Phase 1)
+## Architecture & Implementation
 
-### 1. Database Quota Seeding
-We store the default limits in the `tenant-service` database using the resource name `sandboxes`:
-- **Organization Limit:** 20 sandboxes.
-- **Project Limit:** 5 sandboxes.
+### 1. Database Persistence
+The accepted `egress` block is serialized to JSON and stored in a new `egress_policy JSONB` column in the `sandboxes` table. 
 
-### 2. Centralized Quota Engine
-We use the centralized quota system in `tenant-service` to enforce sandbox limits.
-- **Atomic Operations:** The system sequentially evaluates concurrent requests, guaranteeing that quotas are never over-allocated under heavy load.
-- **Hierarchical Scope:** The system evaluates both the Project-level and Organization-level limits in a single transaction.
+### 2. Creating the Firewall Policy
+Since standard Kubernetes firewalls don't understand website names, our backend will generate a special `CiliumNetworkPolicy` instead. 
+- It will take the exact website name the user typed and place it into a special `toFQDNs` field.
+- This creates a strict security rule that only applies to that specific user's sandbox.
 
-### 3. The "Create Sandbox" Flow
-1. **Reserve:** Ask `tenant-service` to reserve 1 sandbox slot.
-2. **Reject:** If the limit is reached, immediately return a standard `400 Bad Request` error.
-3. **Rollback:** If the slot is reserved but the sandbox fails to create, safely return the slot so it is not permanently lost.
+### 3. How it Works (The Magic)
+When the AI agent tries to visit an allowed website (e.g., `api.github.com`), this is exactly what happens behind the scenes:
+1. The agent asks the network, "What is the IP address for api.github.com?"
+2. Cilium secretly listens to this question, intercepts the answer, and instantly updates the firewall to allow traffic to that specific IP address.
 
-### 4. The "Delete Sandbox" Flow
-1. **Release:** After deleting a sandbox, notify `tenant-service` to free up the slot for future use.
+## Validation Rules
 
-## Future Work
-
-- **CPU-hours.** This prevents users from leaving sandboxes running forever. It will be built in the future by updating the sandbox reconciler to track and store exactly how long each sandbox has been running.
-- **Egress bytes.** This will prevent a single sandbox from downloading terabytes of data and crashing the network. It will be built after the dedicated Sandbox Egress Gateway is launched to monitor network traffic.
+- **Reject Overlapping/Contradictory Rules:** We will reject the request if the user provides duplicate rules or IP ranges that overlap. This keeps the firewall rules clean.
+- **Reject Open Internet:** The API will instantly reject any rule specifying `0.0.0.0/0` (or `::/0`), as this grants unrestricted internet access. The only exception is if an internal platform engineer bypasses this by setting an explicit, audit-logged `allow_internet: true` flag for special debugging cases.
