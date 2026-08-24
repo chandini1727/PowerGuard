@@ -1,6 +1,4 @@
-# Research: Bring-Your-Own-Image (BYOI) for Agent Templates
-
-This document details the research, competitive analysis, and proposed architecture for extending the NeevAI Platform to support **Bring-Your-Own-Image (BYOI)** for custom Agent Templates.
+# Bring-Your-Own-Image (BYOI) for Agent Templates
 
 ## Problem Statement
 
@@ -8,25 +6,18 @@ Currently, the platform only allows users to launch agents using a fixed list of
 
 ## Goals
 
-* **Run Custom Docker Images**: Allow users to run their own custom agent images directly by providing a registry path (e.g. `docker.io/myorg/myimage:v1`) when creating an agent.
-* **Support Private Registries**: Allow users to pull images from locked/private container registries by providing their registry username and access token.
-* **Select How the Agent Interface Works**: Allow users to specify how they want to talk to the agent (using a web UI, a terminal/command line, or running background API requests).
-* **Choose Custom CPU, RAM, and Disk Sizing**: Assign standard system limits for container CPU, RAM, and Disk by default, but allow users to request custom sizes during creation.
-* **Configure Allowed Websites (Network Egress)**: Users must explicitly list which external websites or networks their agent needs to access. If the user does not specify anything, all network access is blocked by default.
-* **Preserve Platform Template Integrity**: Ensure existing platform-curated templates (e.g. Claude Code) continue to work seamlessly without modifications.
+* Allow users to run their own custom agent images directly by providing a registry path (e.g. `docker.io/myorg/myimage:v1`) when creating an agent.
+* Allow users to pull images from private container registries by providing their registry username and access token.
+* Allow users to specify how they want to talk to the agent (using a web UI, a terminal/command line, or running background API requests).
+* Assign standard system limits for container CPU, RAM, and Disk by default, but allow users to request custom sizes during creation.
+* Users must explicitly list which external websites or networks their agent needs to access. If the user does not specify anything, all network access is blocked by default.
+* Ensure existing platform-curated templates continue to work seamlessly without modifications.
 
-### Validation & Policy Goals
-* **OCI Path Syntax Check**: Enforce strict syntax validation for custom OCI image references (requiring explicit domain/path and version tags, while rejecting the `:latest` tag).
-* **Image Existence & Pull Validation**: Verify that the custom image exists and can be successfully pulled (with credentials if private) before declaring the container status as ready.
-* **Rate Limits & Abuse Mitigation**: Enforce runtime limits (e.g. max image size of 50 GB) to prevent resource exhaustion and system abuse.
 
 ## Future Goals
 
 * **Custom Template Registry**: Allow users to save their custom OCI image paths and private registry pull credentials as reusable, organization-scoped templates in the database, so they do not have to re-enter their registry token and image details on every launch request.
-* **Secrets Manager**: Introduce a dedicated credential store allowing users to save registry credentials once and reference them across multiple custom agent launches, rather than providing the registry token every time.
-* **Template Curation & Marketplace**: Provide a community sharing portal or public template marketplace for users to publish and share templates publicly.
-* **Automated gVisor Syscall Probing**: Run automatic compatibility scans using dry-run sandboxes to verify custom images do not run blocked syscalls.
-* **Supply Chain Security & Vulnerability Scanning**: Automate vulnerability scanning (SBOM/signing check) on custom images.
+* **Centralized Registry Credentials Storage (Secrets Manager)**: Introduce a dedicated, centralized credential store (similar to the `airuntime_template_registry_creds` schema used in `airuntime-service`). Users register their private registry credentials once. During agent creation, they pass a `credential_id` reference instead of raw tokens. The control plane fetches the encrypted credential, decrypts it, and automatically creates the required Kubernetes `imagePullSecrets` inside the agent's project namespace at run time.
 
 ---
 
@@ -77,107 +68,226 @@ To design a robust BYOI architecture, we analyzed three leading custom-sandbox/a
 
 ---
 
-## Image registration and management flow
+## Implementation Plan
+
+1. **User Request**: User requests agent creation by giving their custom OCI image path and selecting the UI Mode: `tui` (terminal) or `web` (web dashboard).
+2. **Registry Verification**: The system checks if the image exists in the registry, reads its size (must be under 50 GB), and validates the tag (rejects `:latest`).
+3. **Secret Setup**: If the registry is private, the system creates a secure Kubernetes image pull secret in the namespace.
+4. **Database Registration**: The system saves the agent template as `NULL` in the `agents` table, and stores the image path and command inside the `sandboxes` table.
+5. **Container Booting**: A container pod spins up using the user-provided custom image.
+6. **Egress Firewall Rules**:
+   - **TUI Mode**: Outbound internet is blocked by default. The user can configure their own custom egress/firewall rules.
+   - **Web Mode**: Outbound HTTP/HTTPS network access is enabled by default. This ensures the external ingress gateway can securely map and route incoming preview URL traffic to the running container port, and allows the web agent to communicate with necessary external APIs.
+7. **Health Probing (Startup Delay Guard)**:
+   - For web-based agents, the system runs a `ready_cmd` check (like `curl -s -f http://localhost:8080`) to check if the port is open.
+   - The agent is marked as `Ready` only after the `ready_cmd` probe succeeds, preventing any "404 Not Found" errors.
+8. **User Connection**:
+   - **TUI Agent**: The frontend opens an interactive terminal (PTY over WebSocket) as the main interface.
+   - **Web Agent**: The frontend loads the web URL as the primary interface, but **also** provides an optional terminal (PTY) connection so the user can interact via command line directly.
+   - **How the Web Preview URL is Generated**:
+     - The Control Plane (`aiagent-service`) generates the public preview URL dynamically by combining the sandbox ID and region with the platform's ingress gateway domain pattern (e.g., `https://<sandbox_id>-ui.sandboxes.<region>.neevcloud.com`).
+     - When the user opens this URL, the `sandbox-ingress-gateway` validates the access token and proxies HTTP/WebSocket traffic directly to the agent container's designated UI port.
+
+
+
+## Database Migration Schema
+
+The database requires modifications to allow `agent_template_id` to be nullable in the `agents` table and a new table to store encrypted private registry credentials, mirroring the `airuntime` structure.
+
+```sql
+-- Migration: v0.8.1_allow_byoi_agents.up.sql
+
+-- 1. Make agent_template_id optional for custom BYOI agents
+ALTER TABLE agents ALTER COLUMN agent_template_id DROP NOT NULL;
+
+-- 2. Add index to query BYOI agents efficiently
+CREATE INDEX IF NOT EXISTS idx_agents_byoi ON agents(project_id) WHERE agent_template_id IS NULL;
+
+-- 3. Create table to store private registry credentials (encrypted)
+CREATE TABLE IF NOT EXISTS agent_registry_creds (
+    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id    UUID         NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    username    TEXT         NOT NULL,
+    token       TEXT         NOT NULL, -- Encrypted access token
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Index for querying credentials by agent
+CREATE INDEX IF NOT EXISTS idx_agent_registry_creds_agent_id ON agent_registry_creds(agent_id);
+```
+
+---
+
+## Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-    actor Developer
-    participant CP as aiagent-service (Control Plane)
-    participant DB as aiagents DB
-    participant DP as K8s Cluster (Data Plane)
+    autonumber
+    actor User as User (Browser)
+    participant Platform as Platform API (Control Plane)
+    participant DB as Postgres Database
+    participant K8s as Kubernetes Pod
+    participant Gateway as Ingress/PTY Gateway
 
-    Developer->>CP: POST /agents (image, command, username, token, ui)
-    CP->>CP: Validate image syntax & size (< 50 GB)
-    CP->>CP: Validate registry access & credentials
-    alt Is Custom Image
-        CP->>CP: Set default egress: Allow Internet if UI mode is active (Web/TUI)
+    %% Phase 1: Creation & Validation (Synchronous)
+    Note over User, Platform: PHASE 1: CREATION & VALIDATION (Synchronous)
+    User->>Platform: Submission: POST /agents (image, command, credentials, ui_mode)
+    Platform->>Platform: Pre-flight Check: Validate tag syntax & verify remote OCI registry
+    Platform->>DB: Substrate Binding: Save Agent (template_id = NULL) & Sandbox specs
+    DB-->>Platform: Rows persisted
+    Platform-->>User: 201 Created (Status: Provisioning)
+
+    %% Phase 2: Deployment & Health Checks (Asynchronous Reconciler)
+    Note over Platform, K8s: PHASE 2: DEPLOYMENT & HEALTH CHECKS (Asynchronous Reconciler)
+    alt Private registry credentials exist
+        Platform->>K8s: Secret Generation: Create imagePullSecret in namespace
     end
-    CP->>DB: INSERT into agents (agent_template_id = null)
-    CP->>DB: INSERT into sandboxes (image = custom_image)
-    CP->>DP: Create Sandbox CR (gVisor runtime)
-    DP->>DP: Pull image (with imagePullSecrets) & start container
-    Note over DP: Execute custom command (auto-start)
-    loop ready_cmd probe
-        CP->>DP: Check if FastAPI / web server is live
-        DP-->>CP: 200 OK / Success
+    Platform->>K8s: Provision gVisor container (using custom image & command)
+
+    alt Web Mode Selected
+        loop Health Probe (ready_cmd)
+            Platform->>K8s: Ping custom web port
+            K8s-->>Platform: Port active (Ready == True)
+        end
+    else TUI Mode Selected
+        Note over Platform: Wait for terminal container PTY socket to be ready
     end
-    CP-->>Developer: 201 Created (Agent Ready)
+
+    Platform->>DB: Update agent status to 'Ready'
+
+    %% Phase 3: Client Connection
+    Note over User, Gateway: PHASE 3: CLIENT CONNECTION
+    User->>Platform: POST /agents/{id}/connect (Request connection ticket)
+    
+    alt Case A: Web Mode (returns Web URL + Terminal URL)
+        Platform-->>User: 200 OK (web_url + terminal_url + tokens)
+        User->>Gateway: Accesses web_url (Web UI) OR terminal_url (PTY Terminal)
+        Gateway->>K8s: Proxies traffic directly to container port / command line PTY
+        
+    else Case B: TUI Mode (returns Terminal URL only)
+        Platform-->>User: 200 OK (terminal_url + token)
+        User->>Gateway: Accesses terminal_url (PTY Terminal)
+        Gateway->>K8s: Proxies traffic directly to container command line PTY
+    end
 ```
 
-### 1. Request Structure (`POST /agents`)
+---
 
-When launching a custom agent, the request body accepts the following inline image parameters:
+## API Payload Changes (Extensions to Existing APIs)
 
+### 1. Create Agent (Supporting both Catalogue & BYOI)
+**Endpoint**: `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/agents`
+
+**Request Body (BYOI Example)**:
 ```json
 {
-  "name": "custom-chat-agent",
-  "image": "docker.io/myorg/custom-agent:v1.2",
-  "registry_username": "my_docker_user",
-  "access_token": "dckr_pat_...",
-  "command": ["python", "app.py"],
+  "name": "my-custom-assistant",
+  "image": "docker.io/myorg/custom-agent:v1.2.0",
+  "command": ["python", "main.py", "--port", "8080"],
   "ui": {
     "mode": "web",
     "port": 8080
   },
   "resources": {
-    "cpu": 2,
-    "memory_gb": 4,
-    "disk_gb": 20
-  }
+    "cpu_millicores": 2000,
+    "memory_bytes": 4294967296,
+    "disk_bytes": 21474836480
+  },
+  "egress": {
+    "mode": "allow_list",
+    "allow": [
+      { "host": "api.openai.com" },
+      { "host": "github.com" }
+    ]
+  },
+  "env": {
+    "AGENT_ROLE": "summarizer"
+  },
+  "registry_username": "my_docker_user",
+  "access_token": "dckr_pat_..."
 }
 ```
 
-* **`image` (string)**: The OCI image reference path.
-* **`registry_username` / `access_token` (strings)**: Optional credentials to authenticate pulls if the image is hosted in a private registry.
-* **`command` (array of strings)**: Custom entrypoint command to auto-start the agent.
-* **`ui` (object)**: Configures the interface mode (`web`, `tui`, or `headless`) and port.
+**Response (`201 Created`)**:
+```json
+{
+  "id": "7b79a6d3-2fbf-4c74-8db5-1b5e7d58d928",
+  "name": "my-custom-assistant",
+  "sandbox_id": "ab79a6d3-2fbf-4c74-8db5-1b5e7d58d928",
+  "status": "Provisioning",
+  "created_at": "2026-08-24T15:45:00Z"
+}
+```
 
 ---
 
-### 2. Detailed Execution Steps
+### 2. Connect to Agent UI (Terminal PTY or Preview URL)
+**Endpoint**: `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/agents/{agent_id}/connect`
 
-#### Step 1: Pre-Launch Validation Checks
-Before provisioning any resources, the platform runs the following checks on the custom OCI image:
-* **Image Tag check**: Verifies the image path has a valid version tag/digest and is not using `:latest`.
-* **Access & Credentials check**: Probes the OCI registry (using username and token if the registry is private) to ensure the image is accessible.
-* **Image Size check**: Queries registry metadata to verify the image does not exceed the **50 GB** size limit.
-
-#### Step 2: Database Setup
-The agent is saved in the database with `agent_template_id` set to `NULL`. The custom OCI image path and startup command are stored in the backing `sandboxes` table.
-
-#### Step 3: Container Boot & Auto-Start
-The platform launches a container running the custom image under a secure gVisor sandbox. If private registry credentials were provided, they are injected as Kubernetes image pull secrets. Once the container is running, the platform automatically executes the custom startup `command` in the background.
-
-#### Step 4: Interface Readiness Checks
-The platform verifies the agent is fully loaded depending on the `ui.mode`:
-* **`web`**: Periodically runs the `ready_cmd` test probe (e.g. checking the FastAPI health route) and delays marking the agent as ready until the server starts responding.
-* **`tui`**: Waits for the helper agent (`sandboxd`) inside the container to start its terminal control socket before letting the user connect.
-* **`headless`**: Marks the agent as ready immediately once the container has started running the custom command.
-
-#### Step 5: Network Access Control (Egress)
-* **Custom Rules**: If the user provides a list of allowed websites, the platform allows connections only to those addresses.
-* **Default Rules**: If the user leaves the list empty, all outbound internet access is blocked by default. However, for interactive agents (`web` or `tui` UI modes), the platform automatically configures the network to allow internet access by default so the agent can connect to external model APIs (OpenAI/Anthropic).
+**Response (`200 OK`)**:
+```json
+{
+  "drive_mode": "pty",
+  "connect_url": "wss://term.us-west.neevcloud.com/a/ab79a6d3-2fbf-4c74-8db5-1b5e7d58d928",
+  "token": "ey...",
+  "expires_at": "2026-08-24T16:00:00Z"
+}
+```
 
 ---
 
-### 3. Supported Image Formats & Requirements
-* **Container Formats**: Supports Open Container Initiative (OCI) images and Docker Image Specification V2 Schema 2. 
-* **Compression**: Standard gzip, zstd, and tarball layer compression types are fully supported.
-* **Registry Protocols**: Supports OCI Distribution Spec v1 compliant registries (such as Docker Hub, GitHub Container Registry (GHCR), AWS ECR, and Google Artifact Registry).
 
-### 4. Configuration & Environment-Variable Handling
-* **Custom Environment Variables**: Any environment variables specified in the `POST /agents` request payload are securely injected into the pod definition at startup.
-* **Platform Injections**: The platform automatically injects system environment variables (e.g. `SANDBOX_ID`, `ORG_ID`, `PROJECT_ID`) so the agent sidecar can authenticate and sync.
-* **Sensitive Credentials**: If the user provides private registry access tokens, the platform encrypts the credentials at rest using a secure envelope encryption key. They are never exposed in system logs or environment variables.
+## Supported image formats and requirements
 
-### 5. Networking & Storage Expectations
-* **Network Isolation**: The agent's pod network interface is managed by Cilium. Egress policies are applied dynamically to enforce network restrictions.
-* **Storage Mounts**: The container's root filesystem is mounted as a copy-on-write (COW) layer. Any changes made by the agent during execution are temporary and will be discarded when the sandbox container is paused or recreated. 
-* **Temp Storage**: A writable, high-performance `/tmp` directory is mounted using ephemeral local pod storage, allowing the agent to write scratch files and socket connections.
+* **Supported OS/Architecture**: Only Linux-based `amd64` architecture images are supported. Images built for other architectures (like `arm64`) are rejected.
+* **Supported Registries**: Works with standard OCI container registries, including Docker Hub, GitHub Container Registry (GHCR), Red Hat Quay, AWS ECR, and Google Artifact Registry.
+* **Base Image Shell Requirement**: The platform supports both standard base images (like `alpine`, `ubuntu`, `debian`) and minimal images (like `scratch` or `distroless`). However, minimal images lack shell binaries (like `/bin/sh` or `/bin/bash`), meaning interactive terminal (PTY) connections will fail. We highly recommend using base images that include a shell if you need command-line console access and debugging.
 
-### 6. Versioning & Image Lifecycle Management
-* **Version Pins**: Custom images must use an explicit tag or sha256 digest pin. The `:latest` tag is rejected to guarantee predictability.
-* **Agent Lifecycle**: 
-  - **Create**: Pulls the specific OCI image tag, registers the database state, and boots the container.
-  - **Pause/Resume**: Freezes container execution (using gVisor memory state snapshotting) to save CPU/memory resources when the agent is idle, and resumes instantly.
-  - **Delete**: Cleans up the backing pod in Kubernetes, removes the database rows, and deletes the temporary registry pull secrets.
+---
+
+## Runtime & Security Constraints
+
+* **gVisor Isolation**: All BYOI agents run under gVisor (with runsc). Untrusted system calls are intercepted by the Sentry guest kernel. Any custom image executing blocked syscalls (like raw hardware control or direct network interface manipulation) will be killed with `SIGSYS`.
+* **Resource Limits**: Hard memory and CPU limits are applied. CPU is throttled via CFS shares. Out-of-memory (OOM) inside gVisor kills the container process without impacting the host node.
+* **Egress Policy (Cilium)**: All egress traffic is filtered at the network layer. If no egress rules are specified, all traffic outside the local network is blocked. For interactive web/TUI agents, the platform allows outgoing ports `80` and `443` to common AI providers by default.
+* **File System overlays**: The container rootfs is mounted as a copy-on-write overlay. All modifications to the rootfs are discarded on container reboot/recreation. Durable changes must be written to `/workspace` (persisted on PVC).
+
+---
+
+## Configuration and environment-variable handling
+
+* **User Environment Variables**: User-defined environment variables are injected into the pod spec at creation.
+* **Credential Protection**: Registry credentials (`access_token`) are encrypted at rest using AES-GCM symmetric encryption in the database (using the key managed by the Control Plane). When creating the temporary Kubernetes Secret of type `kubernetes.io/dockerconfigjson` in the namespace, the credentials are base64-encoded.
+
+---
+
+## Networking and storage expectations
+
+* **Storage Mounts**:
+  * `/workspace`: An empty persistent disk (PVC) mounted when the container starts for the first time. Any files generated or executed after the container starts must be saved in `/workspace` to persist across container restarts. This directory is shared with the sandbox manager sidecar daemon.
+  * `/tmp`: Ephemeral local storage (`emptyDir`) for temporary cache files. Capped by disk quota and wiped on restarts.
+* **Port Mapping**: A custom agent utilizing `web` UI mode must bind to the port specified in `ui.port` on all interfaces (`0.0.0.0`) so the system can forward traffic from the `sandbox-ingress-gateway` to this designated container port.
+
+---
+
+## Versioning and image lifecycle management
+
+* **Explicit Tag Check**: All custom container images must specify a precise version tag (e.g. `:v1.2.0`) or digest; the mutable `:latest` tag is strictly blocked to prevent unpredictable image shifts during pause/resume cycles.
+* **Image Caching & Pull Policy**: It uses the `IfNotPresent` pull policy to accelerate container boot and restore times by leveraging cached OCI layers.
+* **Image Updates & Syncing**: If a user updates their image in their remote OCI registry under an existing tag, the platform will not automatically pull the new layers. To force-update the running agent, the user must update the template configuration with a new tag version or a unique SHA256 digest reference.
+* **Node Garbage Collection**: When no active agent sandboxes are referencing a custom image, the cluster node's local container runtime garbage collector will eventually prune the cached layers to free up host disk space.
+
+---
+
+## Validation and compatibility checks
+
+* **OCI Path Syntax Check**: Enforce strict syntax validation for custom OCI image references (requiring explicit domain/path and version tags, while rejecting the `:latest` tag).
+* **Image Existence & Pull Validation**: Verify that the custom image exists and can be successfully pulled (with credentials if private) before declaring the container status as ready.
+* **Rate Limits & Abuse Mitigation**: Enforce runtime limits (e.g. max image size of 50 GB) to prevent resource exhaustion and system abuse.
+
+---
+
+## Open Questions
+
+* **NeevCloud Base Images**: Should the platform provide a standard base OCI image (e.g. `cr.neevcloud.com/ai/base-agent:v1`) containing pre-installed tools like `git`, `wget`, `curl`, `tar`, and `bash` to ensure user images are fully compatible with terminal PTY and snapshot flows?
