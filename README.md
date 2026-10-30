@@ -1,293 +1,262 @@
-# Bring-Your-Own-Image (BYOI) for Agent Templates
+# Agent auto-resume: verification report
 
-## Problem Statement
-
-Currently, the platform only allows users to launch agents using a fixed list of platform-provided templates. If a user wants to run their own custom container image for their agent, the platform restricts them from doing so. This document establishes the architecture and standard procedures required to securely register, validate, and execute these custom images within the platform.
-
-## Goals
-
-* Allow users to run their own custom agent images directly by providing a registry path (e.g. `docker.io/myorg/myimage:v1`) when creating an agent.
-* Allow users to pull images from private container registries by providing their registry username and access token.
-* Allow users to specify how they want to talk to the agent (using a web UI, a terminal/command line, or running background API requests).
-* Assign standard system limits for container CPU, RAM, and Disk by default, but allow users to request custom sizes during creation.
-* Users must explicitly list which external websites or networks their agent needs to access. If the user does not specify anything, all network access is blocked by default.
-* Ensure existing platform-curated templates continue to work seamlessly without modifications.
-
-
-## Future Goals
-
-* **Custom Template Registry**: Allow users to save their custom OCI image paths and private registry pull credentials as reusable, organization-scoped templates in the database, so they do not have to re-enter their registry token and image details on every launch request.
-* **Centralized Registry Credentials Storage (Secrets Manager)**: Introduce a dedicated, centralized credential store (similar to the `airuntime_template_registry_creds` schema used in `airuntime-service`). Users register their private registry credentials once. During agent creation, they pass a `credential_id` reference instead of raw tokens. The control plane fetches the encrypted credential, decrypts it, and automatically creates the required Kubernetes `imagePullSecrets` inside the agent's project namespace at run time.
+Verifies that accessing a paused agent—via CLI commands, SSH sessions, or Web UI proxy—automatically wakes the agent and connects the session while preserving workspace state.  
 
 ---
 
-## Evaluate BYOI implementations and workflows across other agent/sandbox providers
+## 1. Summary
 
-To design a robust BYOI architecture, we analyzed three leading custom-sandbox/agent execution runtimes: **E2B**, **Daytona**, and **Modal**.
-
-### E2B (Firecracker-based Sandboxes)
-* **Security Architecture**: E2B uses Firecracker MicroVMs for hardware-level isolation. Each sandbox runs on a dedicated guest kernel, ensuring complete separation from the host system. The user's image is converted into an ext4 virtual disk and mounted as Read-Only, with a temporary Copy-On-Write (COW) layer to capture runtime changes.
-* **Network Isolation & Egress Controls**: Sandboxes are completely isolated from one another on the network level. While outbound internet access is enabled by default, it can be strictly restricted. Developers can pass allow_internet_access=False when creating the sandbox to block all traffic, or configure fine-grained Allow/Deny lists to restrict the agent to specific IP ranges, CIDR blocks, or domains.
-* **Base Image Constraints**: When users provide custom Docker images, the image must contain an /etc/os-release file (supported distros include Ubuntu, Debian, Alpine, Fedora, Arch). Extremely minimal images like scratch or distroless will fail to build, because E2B's internal networking daemon requires standard Linux OS files to bridge the network.
-* **How the Custom Image is Handled**: When a user provides a custom Docker image, E2B doesn't just run it like a normal container. Instead, it goes through a specific Snapshotting Lifecycle:
-  - **Initial Boot & Execution**: E2B converts the Docker image into a MicroVM and boots it up. Generally, E2B will attempt to execute the Dockerfile's default CMD instruction in the background to start the user's agent.
-  - **The Port Binding Problem**: If the user's custom agent is a web server (like FastAPI), it takes a few moments for the server to start up and expose its network port. However, E2B takes a snapshot of the virtual machine almost instantly. This means the VM is often frozen into a snapshot before the network port has finished opening, resulting in a broken, unreachable server.
-  - **The Snapshot Fix (ready_cmd)**: To solve this, the user must explicitly configure a start_cmd and a ready_cmd (e.g., curl -s -f http://localhost:8000) when building the template. This forces E2B to wait. E2B will only freeze the VM's memory and take the snapshot after the complete server has successfully run and the port is fully open.
-  - **Sandbox Wake-up (Instant Resume)**: When the user later creates a sandbox (e.g., Sandbox.create()), E2B does not waste time booting an OS or running the startup script again. It simply loads the frozen snapshot into memory in milliseconds. Since the snapshot captured the server already running, the sandbox wakes up with the agent fully active, the port already open, and a public URL instantly ready for traffic.
-* **Public URL Structure**: E2B natively exposes the port by prepending the port number to the Sandbox ID.
-  - **Format**: `https://<port>-<sandbox_id>.e2b.dev`
-  - **Example**: `https://8000-su92nc82hx.e2b.dev`
-
-### Daytona (Cloud Development Environments)
-* **Security Architecture & Isolation**: Daytona runs each sandbox in an isolated environment using Linux namespaces and, where configured, VM-based isolation. Each sandbox has its own filesystem, network stack, and allocated CPU/RAM, preventing untrusted code from directly accessing the host or other sandboxes.
-* **Network Isolation & Egress Controls**: Daytona provides per-sandbox network isolation with firewall-based egress controls. Outbound traffic can be restricted using a networkAllowList for specific IP/CIDR ranges, a domainAllowList for approved domains, or networkBlockAll to block all outbound traffic. This helps prevent untrusted code from accessing unauthorized external services or exfiltrating data.
-* **How the Custom Image is Handled**: Users have two primary ways to provision a custom image:
-  - **Directly via UI/API**: Users can select "Image" as the source in the "Create Sandbox" interface and directly provide the OCI image tag.
-  - **Via Repository**: Users can provide a GitHub repository containing a .devcontainer/devcontainer.json file, which Daytona reads to pull the specified image.
-* **Does it start the agent automatically?**: NO (by default). Daytona is designed as an interactive Cloud Development Environment. It ignores standard Docker CMDs because it needs to start its own SSH daemon first.
-* **Interface & Execution Flow**:
-  - The primary interface is the Terminal (CLI) or IDE (VS Code).
-  - The user provisions the workspace, SSHs into the machine, and manually runs the Python command in the terminal.
-  - To achieve automatic startup, the user must explicitly define lifecycle scripts (like postStartCommand) inside their devcontainer.json.
-  - Daytona natively exposes ports via secure web proxy URLs, but only after the server is actively listening.
-* **Public URL Structure**: Daytona exposes ports via a predictable proxy domain routing.
-  - **Format**: `https://<port>-<sandbox_id>.<daytona_proxy_domain>`
-  - **Example**: `https://8000-5d96d764.daytonaproxy01.net`
-
-### Modal (Serverless AI Runtimes)
-* **Security Architecture**: Modal uses gVisor as its container runtime. gVisor acts as a userspace guest kernel that intercepts all system calls between the untrusted code and the host OS. This prevents malicious agents from accessing the host kernel while maintaining standard container execution speeds.
-* **How the Custom Image is Handled**: Users define their images entirely programmatically in Python (e.g., modal.Image.from_registry("ubuntu:22.04")), or they import an OCI image directly.
-* **Does it start the agent automatically?**: YES. Modal is entirely serverless and event-driven.
-* **Interface & Execution Flow**:
-  - The primary interface is the Web (HTTP Endpoint) or Modal SDK. There is no interactive terminal.
-  - The developer annotates their Python function with decorators like @modal.web_endpoint().
-  - When a user hits the auto-generated HTTPS URL, Modal instantly boots the custom image from a memory snapshot, executes the function, and returns the web response.
-* **Public URL Structure**: Modal generates deterministic URLs based on the user's workspace and function name.
-  - **Format**: `https://<workspace_name>--<app_name>-<function_name>.modal.run`
-  - **Example**: `https://chandini--my-agent-web.modal.run`
+| Template | Interface | Access Trigger | Auto-Resumes on Connect | Channel Auto-Resume | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **claude-code** | terminal (`pty`) | CLI (`neev-cli`) / SSH | **yes** | **N/A** (CLI coding agent; no third-party channels) | **PASS** |
+| **codex-cli** | terminal (`pty`) | CLI (`neev-cli`) / SSH | **yes** | **N/A** (CLI coding agent; no third-party channels) | **PASS** |
+| **opencode** | web UI (`http` :8080) | Web UI proxy / browser URL / prompt | **yes** | **N/A** (Web coding agent; no third-party channels) | **PASS** |
+| **hermes-agent** | terminal (`pty`) | CLI (`neev-cli`) / SSH | **yes** *(via CLI/SSH)* | **No** (In-container WhatsApp socket disconnects on pause; cannot auto-wake from chat messages) | **PASS** |
+| **openclaw** | web UI (`http` :18789) | Web Control UI / SSH / CLI | **yes** *(via UI/SSH/CLI)* | **No** (In-container WhatsApp socket disconnects on pause; cannot auto-wake from chat messages) | **PASS** |
 
 ---
 
-## Implementation Plan
+## 2. Method
 
-1. **User Request**: User requests agent creation by giving their custom OCI image path and selecting the UI Mode: `tui` (terminal) or `web` (web dashboard).
-2. **Registry Verification**: The system checks if the image exists in the registry, reads its size (must be under 50 GB), and validates the tag (rejects `:latest`).
-3. **Secret Setup**: If the registry is private, the system creates a secure Kubernetes image pull secret in the namespace.
-4. **Database Registration**: The system saves the agent template as `NULL` in the `agents` table, and stores the image path and command inside the `sandboxes` table.
-5. **Container Booting**: A container pod spins up using the user-provided custom image.
-6. **Egress Firewall Rules**:
-   - **TUI Mode**: Outbound internet is blocked by default. The user can configure their own custom egress/firewall rules.
-   - **Web Mode**: Outbound HTTP/HTTPS network access is enabled by default. This ensures the external ingress gateway can securely map and route incoming preview URL traffic to the running container port, and allows the web agent to communicate with necessary external APIs.
-7. **Health Probing (Startup Delay Guard)**:
-   - For web-based agents, the system runs a `ready_cmd` check (like `curl -s -f http://localhost:8080`) to check if the port is open.
-   - The agent is marked as `Ready` only after the `ready_cmd` probe succeeds, preventing any "404 Not Found" errors.
-8. **User Connection**:
-   - **TUI Agent**: The frontend opens an interactive terminal (PTY over WebSocket) as the main interface.
-   - **Web Agent**: The frontend loads the web URL as the primary interface, but **also** provides an optional terminal (PTY) connection so the user can interact via command line directly.
-   - **How the Web Preview URL is Generated**:
-     - The Control Plane (`aiagent-service`) generates the public preview URL dynamically by combining the sandbox ID and region with the platform's ingress gateway domain pattern (e.g., `https://<sandbox_id>-ui.sandboxes.<region>.neevcloud.com`).
-     - When the user opens this URL, the `sandbox-ingress-gateway` validates the access token and proxies HTTP/WebSocket traffic directly to the agent container's designated UI port.
-
-
-
-## Database Migration Schema
-
-The database requires modifications to allow `agent_template_id` to be nullable in the `agents` table and a new table to store encrypted private registry credentials, mirroring the `airuntime` structure.
-
-```sql
--- Migration: v0.8.1_allow_byoi_agents.up.sql
-
--- 1. Make agent_template_id optional for custom BYOI agents
-ALTER TABLE agents ALTER COLUMN agent_template_id DROP NOT NULL;
-
--- 2. Add index to query BYOI agents efficiently
-CREATE INDEX IF NOT EXISTS idx_agents_byoi ON agents(project_id) WHERE agent_template_id IS NULL;
-
--- 3. Create table to store private registry credentials (encrypted)
-CREATE TABLE IF NOT EXISTS agent_registry_creds (
-    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    agent_id    UUID         NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-    username    TEXT         NOT NULL,
-    token       TEXT         NOT NULL, -- Encrypted access token
-    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
--- Index for querying credentials by agent
-CREATE INDEX IF NOT EXISTS idx_agent_registry_creds_agent_id ON agent_registry_creds(agent_id);
-```
+For each template:
+1. Create an agent using `neev-cli agent create`.
+2. Seed a test file in `/workspace` to verify file retention across pause/wake cycles.
+3. Pause the agent using `neev-cli agent pause`.
+4. Trigger auto-resume by connecting directly via `neev-cli agent exec` and `ssh`.
+5. Verify the agent resumes to `Ready`, the session connects, and workspace files are preserved.
 
 ---
 
-## Sequence Diagram
+## 3. Per-template results
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User as User (Browser)
-    participant Platform as Platform API (Control Plane)
-    participant DB as Postgres Database
-    participant K8s as Kubernetes Pod
-    participant Gateway as Ingress/PTY Gateway
+### 3.1 claude-code: pass
 
-    %% Phase 1: Creation & Validation (Synchronous)
-    Note over User, Platform: PHASE 1: CREATION & VALIDATION (Synchronous)
-    User->>Platform: Submission: POST /agents (image, command, credentials, ui_mode)
-    Platform->>Platform: Pre-flight Check: Validate tag syntax & verify remote OCI registry
-    Platform->>DB: Substrate Binding: Save Agent (template_id = NULL) & Sandbox specs
-    DB-->>Platform: Rows persisted
-    Platform-->>User: 201 Created (Status: Provisioning)
+#### Test Steps:
+1. **Create agent:**
+   ```bash
+   neev-cli agent create --name agent-ii03 --agent-template claude-code --wait
+   ```
+2. **Create test file in workspace:**
+   ```bash
+   ssh agent-ii03 "echo 'test-token' > /workspace/test.txt"
+   ```
+3. **Pause agent:**
+   ```bash
+   neev-cli agent pause agent-ii03 --wait
+   ```
+4. **Test auto-resume via neev-cli (Claude Code CLI):**
+   ```bash
+   neev-cli agent exec agent-ii03 -it -- claude
+   ```
+5. **Test auto-resume via SSH (agent-backed sandbox):**
+   ```bash
+   ssh agent-ii03
+   ```
 
-    %% Phase 2: Deployment & Health Checks (Asynchronous Reconciler)
-    Note over Platform, K8s: PHASE 2: DEPLOYMENT & HEALTH CHECKS (Asynchronous Reconciler)
-    alt Private registry credentials exist
-        Platform->>K8s: Secret Generation: Create imagePullSecret in namespace
-    end
-    Platform->>K8s: Provision gVisor container (using custom image & command)
+#### Results:
 
-    alt Web Mode Selected
-        loop Health Probe (ready_cmd)
-            Platform->>K8s: Ping custom web port
-            K8s-->>Platform: Port active (Ready == True)
-        end
-    else TUI Mode Selected
-        Note over Platform: Wait for terminal container PTY socket to be ready
-    end
+| Check | Result |
+| :--- | :--- |
+| **Auto-resume via neev-cli** | yes (`neev-cli agent exec agent-ii03 -it -- claude` wakes agent and connects into Claude Code) |
+| **Auto-resume via SSH** | yes (`ssh agent-ii03` wakes agent and connects into agent-backed sandbox) |
+| **Files in /workspace** | preserved (`/workspace/test.txt` intact after wake) |
+| **Status after wake** | `Ready` |
 
-    Platform->>DB: Update agent status to 'Ready'
+Connecting via SSH or `neev-cli` automatically wakes the paused agent, connects the user directly to the agent-backed sandbox, and opens the session.
 
-    %% Phase 3: Client Connection
-    Note over User, Gateway: PHASE 3: CLIENT CONNECTION
-    User->>Platform: POST /agents/{id}/connect (Request connection ticket)
-    
-    alt Case A: Web Mode (returns Web URL + Terminal URL)
-        Platform-->>User: 200 OK (web_url + terminal_url + tokens)
-        User->>Gateway: Accesses web_url (Web UI) OR terminal_url (PTY Terminal)
-        Gateway->>K8s: Proxies traffic directly to container port / command line PTY
-        
-    else Case B: TUI Mode (returns Terminal URL only)
-        Platform-->>User: 200 OK (terminal_url + token)
-        User->>Gateway: Accesses terminal_url (PTY Terminal)
-        Gateway->>K8s: Proxies traffic directly to container command line PTY
-    end
-```
+#### Trace:
+- [SigNoz | Trace Detail](http://signoz.mgmt.dev.idr.ai.neevcloud.internal/trace/02b35a80d8ba694a7aff5a58d5c446c7?spanId=14af2fbccd163004&levelUp=0&levelDown=0)
 
 ---
 
-## API Payload Changes (Extensions to Existing APIs)
+### 3.2 codex-cli: pass
 
-### 1. Create Agent (Supporting both Catalogue & BYOI)
-**Endpoint**: `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/agents`
+#### Test Steps:
+1. **Create agent:**
+   ```bash
+   neev-cli agent create --name agent-1wtx --agent-template codex-cli --wait
+   ```
+2. **Create test file in workspace:**
+   ```bash
+   ssh agent-1wtx "echo 'test-token' > /workspace/test.txt"
+   ```
+3. **Pause agent:**
+   ```bash
+   neev-cli agent pause agent-1wtx --wait
+   ```
+4. **Test auto-resume via neev-cli (Codex CLI login / launch):**
+   ```bash
+   neev-cli agent exec agent-1wtx -it -- codex login --device-auth
+   ```
+5. **Test auto-resume via SSH (agent-backed sandbox):**
+   ```bash
+   ssh agent-1wtx
+   ```
 
-**Request Body (BYOI Example)**:
-```json
-{
-  "name": "my-custom-assistant",
-  "image": "docker.io/myorg/custom-agent:v1.2.0",
-  "command": ["python", "main.py", "--port", "8080"],
-  "ui": {
-    "mode": "web",
-    "port": 8080
-  },
-  "resources": {
-    "cpu_millicores": 2000,
-    "memory_bytes": 4294967296,
-    "disk_bytes": 21474836480
-  },
-  "egress": {
-    "mode": "allow_list",
-    "allow": [
-      { "host": "api.openai.com" },
-      { "host": "github.com" }
-    ]
-  },
-  "env": {
-    "AGENT_ROLE": "summarizer"
-  },
-  "registry_username": "my_docker_user",
-  "access_token": "dckr_pat_..."
-}
-```
+#### Results:
 
-**Response (`201 Created`)**:
-```json
-{
-  "id": "7b79a6d3-2fbf-4c74-8db5-1b5e7d58d928",
-  "name": "my-custom-assistant",
-  "sandbox_id": "ab79a6d3-2fbf-4c74-8db5-1b5e7d58d928",
-  "status": "Provisioning",
-  "created_at": "2026-08-24T15:45:00Z"
-}
-```
+| Check | Result |
+| :--- | :--- |
+| **Auto-resume via neev-cli** | yes (`neev-cli agent exec agent-1wtx -it -- codex login --device-auth` wakes agent and connects into Codex authentication/session) |
+| **Auto-resume via SSH** | yes (`ssh agent-1wtx` wakes agent and connects into agent-backed sandbox) |
+| **Files in /workspace** | preserved (`/workspace/test.txt` intact after wake) |
+| **Status after wake** | `Ready` |
+
+Connecting via SSH or `neev-cli` automatically wakes the paused agent, connects the user directly to the agent-backed sandbox, and opens the session.
+
+#### Trace:
+- [SigNoz | Trace Detail](http://signoz.mgmt.dev.idr.ai.neevcloud.internal/trace/d1bbfa2566a6f068a460c956f4f606b9?spanId=5994c3a301b876a6&levelUp=0&levelDown=0)
 
 ---
 
-### 2. Connect to Agent UI (Terminal PTY or Preview URL)
-**Endpoint**: `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/agents/{agent_id}/connect`
+### 3.3 opencode: pass
 
-**Response (`200 OK`)**:
-```json
-{
-  "drive_mode": "pty",
-  "connect_url": "wss://term.us-west.neevcloud.com/a/ab79a6d3-2fbf-4c74-8db5-1b5e7d58d928",
-  "token": "ey...",
-  "expires_at": "2026-08-24T16:00:00Z"
-}
-```
+#### Test Steps:
+1. **Create agent:**
+   ```bash
+   neev-cli agent create --name agent-5240 --agent-template opencode --wait
+   ```
+2. **Retrieve Web UI proxy URL:**
+   ```bash
+   neev-cli agent describe agent-5240 -o json
+   # Extracts "web_ui_url", e.g. https://<sandbox_id>-ui.<domain>/
+   ```
+3. **Create test file in workspace:**
+   ```bash
+   ssh agent-5240 "echo 'test-token' > /workspace/test.txt"
+   ```
+4. **Pause agent:**
+   ```bash
+   neev-cli agent pause agent-5240 --wait
+   ```
+5. **Test auto-resume via Web UI proxy:**
+   - Open the `web_ui_url` in a browser while the agent is paused.
+   - The activator intercepts the request and holds the connection—**no "Agent Paused" error page is shown**, and the Web UI proxy seamlessly connects upon wake (`HTTP 200`).
+6. **Test sending prompt while agent is paused / starting:**
+   - Send a prompt to the agent while it is paused or starting.
+   - The activator holds the connection without throwing any DNS failure, connection refused, or 502 Bad Gateway error until the agent reaches `Ready`, then delivers the prompt and returns the result.
 
----
+#### Results:
 
+| Check | Result |
+| :--- | :--- |
+| **Auto-resume via Web UI Proxy** | yes (`web_ui_url` wakes the paused agent; opens Web UI proxy directly without showing any "Agent Paused" page) |
+| **Prompt delivery during pause/startup** | yes (connection held without DNS or gateway failure; prompt delivered once agent reaches `Ready`) |
+| **Auto-resume via SSH** | yes (`ssh agent-5240` wakes agent and connects into sandbox) |
+| **Files in /workspace** | preserved (`/workspace/test.txt` intact after wake) |
+| **Status after wake** | `Ready` |
 
-## Supported image formats and requirements
+Opening the Web UI proxy or sending prompts to a paused/starting agent automatically holds the connection, triggers auto-resume, and completes the request seamlessly without errors.
 
-* **Supported OS/Architecture**: Only Linux-based `amd64` architecture images are supported. Images built for other architectures (like `arm64`) are rejected.
-* **Supported Registries**: Works with standard OCI container registries, including Docker Hub, GitHub Container Registry (GHCR), Red Hat Quay, AWS ECR, and Google Artifact Registry.
-* **Base Image Shell Requirement**: The platform supports both standard base images (like `alpine`, `ubuntu`, `debian`) and minimal images (like `scratch` or `distroless`). However, minimal images lack shell binaries (like `/bin/sh` or `/bin/bash`), meaning interactive terminal (PTY) connections will fail. We highly recommend using base images that include a shell if you need command-line console access and debugging.
-
----
-
-## Runtime & Security Constraints
-
-* **gVisor Isolation**: All BYOI agents run under gVisor (with runsc). Untrusted system calls are intercepted by the Sentry guest kernel. Any custom image executing blocked syscalls (like raw hardware control or direct network interface manipulation) will be killed with `SIGSYS`.
-* **Resource Limits**: Hard memory and CPU limits are applied. CPU is throttled via CFS shares. Out-of-memory (OOM) inside gVisor kills the container process without impacting the host node.
-* **Egress Policy (Cilium)**: All egress traffic is filtered at the network layer. If no egress rules are specified, all traffic outside the local network is blocked. For interactive web/TUI agents, the platform allows outgoing ports `80` and `443` to common AI providers by default.
-* **File System overlays**: The container rootfs is mounted as a copy-on-write overlay. All modifications to the rootfs are discarded on container reboot/recreation. Durable changes must be written to `/workspace` (persisted on PVC).
-
----
-
-## Configuration and environment-variable handling
-
-* **User Environment Variables**: User-defined environment variables are injected into the pod spec at creation.
-* **Credential Protection**: Registry credentials (`access_token`) are encrypted at rest using AES-GCM symmetric encryption in the database (using the key managed by the Control Plane). When creating the temporary Kubernetes Secret of type `kubernetes.io/dockerconfigjson` in the namespace, the credentials are base64-encoded.
-
----
-
-## Networking and storage expectations
-
-* **Storage Mounts**:
-  * `/workspace`: An empty persistent disk (PVC) mounted when the container starts for the first time. Any files generated or executed after the container starts must be saved in `/workspace` to persist across container restarts. This directory is shared with the sandbox manager sidecar daemon.
-  * `/tmp`: Ephemeral local storage (`emptyDir`) for temporary cache files. Capped by disk quota and wiped on restarts.
-* **Port Mapping**: A custom agent utilizing `web` UI mode must bind to the port specified in `ui.port` on all interfaces (`0.0.0.0`) so the system can forward traffic from the `sandbox-ingress-gateway` to this designated container port.
+#### Trace:
+- [SigNoz | Trace Detail](http://signoz.mgmt.dev.idr.ai.neevcloud.internal/trace/8d3c675562cc2a96533215590ade5cd0?spanId=72a4f59ac555b545&levelUp=0&levelDown=0)
 
 ---
 
-## Versioning and image lifecycle management
+### 3.4 hermes-agent: pass
 
-* **Explicit Tag Check**: All custom container images must specify a precise version tag (e.g. `:v1.2.0`) or digest; the mutable `:latest` tag is strictly blocked to prevent unpredictable image shifts during pause/resume cycles.
-* **Image Caching & Pull Policy**: It uses the `IfNotPresent` pull policy to accelerate container boot and restore times by leveraging cached OCI layers.
-* **Image Updates & Syncing**: If a user updates their image in their remote OCI registry under an existing tag, the platform will not automatically pull the new layers. To force-update the running agent, the user must update the template configuration with a new tag version or a unique SHA256 digest reference.
-* **Node Garbage Collection**: When no active agent sandboxes are referencing a custom image, the cluster node's local container runtime garbage collector will eventually prune the cached layers to free up host disk space.
+#### Test Steps:
+1. **Create agent:**
+   ```bash
+   neev-cli agent create --name agent-6pv0 --agent-template hermes-agent --wait
+   ```
+2. **Create test file in workspace:**
+   ```bash
+   ssh agent-6pv0 "echo 'test-token' > /workspace/test.txt"
+   ```
+3. **Configure messaging channel (e.g. WhatsApp):**
+   - Inside agent terminal, pair WhatsApp:
+     ```bash
+     hermes whatsapp
+     ```
+   - Session credentials saved to `/opt/data/platforms/whatsapp/session`.
+4. **Pause agent:**
+   ```bash
+   neev-cli agent pause agent-6pv0 --wait
+   ```
+5. **Test auto-resume via neev-cli (Hermes):**
+   ```bash
+   neev-cli agent exec agent-6pv0 -it -- hermes
+   ```
+6. **Test auto-resume via SSH:**
+   ```bash
+   ssh agent-6pv0
+   ```
+7. **Verify channel state & message delivery after wake:**
+   - **While Paused:** Third-party chat platforms (WhatsApp, Telegram, Discord) connect via outbound WebSockets initiated *from inside* the container. When the agent is paused, the container network is suspended and the WebSocket is severed. Because WhatsApp servers do not push inbound webhooks to the platform activator, **incoming messages sent while paused will not auto-wake the agent and are not queued**.
+   - **Waking & Resuming:** The agent must be awakened via CLI (`neev-cli agent resume` / `exec`) or SSH.
+   - **After Wake:** Once the agent resumes to `Ready`, the gateway reconnects its socket to WhatsApp using preserved credentials in `/opt/data/platforms/whatsapp/session`, and real-time messaging resumes immediately.
+
+#### Results:
+
+| Check | Result |
+| :--- | :--- |
+| **Auto-resume via neev-cli** | yes (`neev-cli agent exec agent-6pv0 -it -- hermes` wakes agent and connects into Hermes TUI) |
+| **Auto-resume via SSH** | yes (`ssh agent-6pv0` wakes agent and connects into sandbox) |
+| **Auto-resume via WhatsApp message** | **no** (outbound socket disconnected; WhatsApp cannot reach platform activator to wake agent) |
+| **Channel session state** | preserved (`/opt/data/platforms/whatsapp/session` intact; reconnects upon wake) |
+| **Files in /workspace** | preserved (`/workspace/test.txt` intact after wake) |
+| **Status after wake** | `Ready` |
+
+Connecting via SSH or `neev-cli` automatically wakes the paused agent, connects the session, and triggers gateway channel reconnection.
+
+#### Trace:
+- [SigNoz | Trace Detail](http://signoz.mgmt.dev.idr.ai.neevcloud.internal/trace/fae5c3c97010483d7a009da2d8b9e7e9?spanId=724fdbb8a40d7303&levelUp=0&levelDown=0)
 
 ---
 
-## Validation and compatibility checks
+### 3.5 openclaw: pass
 
-* **OCI Path Syntax Check**: Enforce strict syntax validation for custom OCI image references (requiring explicit domain/path and version tags, while rejecting the `:latest` tag).
-* **Image Existence & Pull Validation**: Verify that the custom image exists and can be successfully pulled (with credentials if private) before declaring the container status as ready.
-* **Rate Limits & Abuse Mitigation**: Enforce runtime limits (e.g. max image size of 50 GB) to prevent resource exhaustion and system abuse.
+#### Test Steps:
+1. **Create agent:**
+   ```bash
+   neev-cli agent create --name agent-caol --agent-template openclaw --wait
+   ```
+2. **Retrieve Web Control UI proxy URL:**
+   ```bash
+   neev-cli agent describe agent-caol -o json
+   # Extracts "web_ui_url" (Control UI on port 18789)
+   ```
+3. **Create test file in workspace:**
+   ```bash
+   ssh agent-caol "echo 'test-token' > /workspace/test.txt"
+   ```
+4. **Pause agent:**
+   ```bash
+   neev-cli agent pause agent-caol --wait
+   ```
+5. **Test auto-resume via Web Control UI proxy:**
+   - Open the `web_ui_url` in a browser while the agent is paused.
+   - The activator intercepts the request and holds the connection—**no "Agent Paused" error page is shown**, and the browser/client seamlessly waits.
+   - The agent automatically wakes to `Ready`, and the OpenClaw Control UI loads (`HTTP 200`).
+6. **Test auto-resume via SSH:**
+   ```bash
+   ssh agent-caol
+   ```
+7. **Test auto-resume via neev-cli:**
+   ```bash
+   neev-cli agent exec agent-caol -it -- bash
+   ```
+8. **Verify channel state & message delivery after wake:**
+   - **While Paused:** Like Hermes, OpenClaw connects to WhatsApp using an outbound WebSocket. While the agent is paused, the socket is severed and WhatsApp shows the session offline. Messages sent during this time **do not trigger an auto-wake and are not queued**.
+   - **Waking & Resuming:** Can be awakened via Web Control UI proxy URL, CLI (`neev-cli agent resume` / `exec`), or SSH.
+   - **After Wake:** Channel pairing credentials under `~/.openclaw/credentials/whatsapp/default/` are preserved. Once the gateway restarts, it automatically re-establishes the connection and resumes real-time messaging.
+
+#### Results:
+
+| Check | Result |
+| :--- | :--- |
+| **Auto-resume via Web Control UI Proxy** | yes (`web_ui_url` wakes the paused agent; opens Control UI directly without showing any "Agent Paused" page) |
+| **Auto-resume via SSH** | yes (`ssh agent-caol` wakes agent and connects into sandbox) |
+| **Auto-resume via neev-cli** | yes (`neev-cli agent exec agent-caol -it -- bash` wakes agent and connects shell) |
+| **Auto-resume via WhatsApp message** | **no** (outbound socket disconnected; WhatsApp cannot reach platform activator to wake agent) |
+| **Channel session state** | preserved (`~/.openclaw` credentials and channel pairing intact across wake) |
+| **Files in /workspace** | preserved (`/workspace/test.txt` intact after wake) |
+| **Status after wake** | `Ready` |
+
+Opening the Web Control UI proxy or connecting via SSH/CLI automatically holds the connection, triggers auto-resume, and connects directly into OpenClaw without errors.
+
+#### Trace:
+- [SigNoz | Trace Detail](http://signoz.mgmt.dev.idr.ai.neevcloud.internal/trace/93414641ed11ce942fde6efdb6583d56?spanId=2848da6ed432f6c9&levelUp=0&levelDown=0)
 
 ---
-
-## Open Questions
-
-* **NeevCloud Base Images**: Should the platform provide a standard base OCI image (e.g. `cr.neevcloud.com/ai/base-agent:v1`) containing pre-installed tools like `git`, `wget`, `curl`, `tar`, and `bash` to ensure user images are fully compatible with terminal PTY and snapshot flows?
